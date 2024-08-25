@@ -1,0 +1,4 @@
+__pycache__
+adversarial_tasks
+new_training_examples
+*.json
