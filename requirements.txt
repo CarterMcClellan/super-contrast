@@ -1,0 +1,8 @@
+datasets
+langchain
+langchain-openai
+scikit-learn
+torch
+torchvision
+transformers
+transformers[torch]
