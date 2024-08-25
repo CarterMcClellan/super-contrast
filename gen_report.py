@@ -1,6 +1,7 @@
 import argparse
 import json
 from typing import Dict, List
+import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from datasets import load_dataset, IterableDataset, Dataset
 from tqdm import tqdm
@@ -18,7 +19,8 @@ def gen_report(model_path: str, dataset_name: str, split: str, text_column: str,
     model, tokenizer = load_model_and_tokenizer(model_path)
     
     # Create a pipeline for text classification
-    classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    classifier = pipeline("text-classification", model=model, tokenizer=tokenizer, device=device)
     
     # Load the specified dataset
     dataset = load_dataset(dataset_name)
@@ -33,13 +35,13 @@ def gen_report(model_path: str, dataset_name: str, split: str, text_column: str,
     
     # Get predictions
     total_samples = len(ds_eval[text_column])
-    batch_size = 32
+    batch_size = 128 if torch.cuda.is_available() else 32 
     predictions = []
     print(f"Starting inference on {total_samples} samples...")
     for i in tqdm(range(0, total_samples, batch_size), desc="Inference Progress"):
         batch = ds_eval[text_column][i:i+batch_size]
         batch_predictions = classifier(batch, truncation=True, max_length=128)
-        predictions.extend(batch_predictions) # type: ignore
+        predictions.extend(batch_predictions)
     
     predicted_labels = [pred['label'] for pred in predictions]
     true_labels = ds_eval[label_column]
@@ -50,6 +52,7 @@ def gen_report(model_path: str, dataset_name: str, split: str, text_column: str,
     # Create wrong_predictions dictionary
     wrong_predictions: Dict[str, GroupedComparison] = {}
     for true_label, pred_label, text in zip(true_labels, predicted_labels, ds_eval[text_column]):
+        true_label, pred_label = str(true_label), str(pred_label)
         if true_label != pred_label:
             if true_label not in wrong_predictions:
                 wrong_predictions[true_label] = GroupedComparison(model_preds={})
@@ -60,8 +63,8 @@ def gen_report(model_path: str, dataset_name: str, split: str, text_column: str,
                 ComparisonItem(
                     path=None,
                     data=text,
-                    true_label=true_label,
-                    model_pred=pred_label
+                    true_label=str(true_label),
+                    model_pred=str(pred_label)
                 )
             )
     
@@ -71,8 +74,10 @@ def gen_report(model_path: str, dataset_name: str, split: str, text_column: str,
         accuracy=float(accuracy),
         wrong_predictions=wrong_predictions
     )
-    
-    with open("report.json", 'w', encoding='utf-8') as f:
+
+    output_path = model_path.replace("/", "_") 
+    output_path = f"{output_path}_report.json"
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(evaluation.dict(), f, ensure_ascii=False, indent=4)
     
     # Print evaluation results

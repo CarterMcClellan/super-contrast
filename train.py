@@ -18,11 +18,11 @@ from transformers import (
 # Helper functions
 def tokenize_text(sequence):
     """Tokenize input sequence."""
-    return tokenizer(sequence["text"], truncation=True, max_length=128)
+    return tokenizer(sequence[text_column], truncation=True, max_length=128)
 
 def encode_labels(example):
     """Map string labels to integers."""
-    example["labels"] = label2id[example["labels"]]
+    example["labels"] = label2id[example[label_column]]
     return example
 
 def compute_metrics(pred):
@@ -36,26 +36,33 @@ def compute_metrics(pred):
         "f1": f1
     }
 
-def main(model_ckpt):
+def train(model_ckpt, dataset_name, text_col, label_col):
     # Setup
-    global tokenizer, label2id
+    global tokenizer, label2id, text_column, label_column
+    text_column = text_col
+    label_column = label_col
 
-    gdrive_dir = Path('langid')
+    normalized_name = dataset_name.replace('/', '_')
+    gdrive_dir = Path(f'{normalized_name}_model_finetuning')
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
 
     # Load and split dataset
-    dataset = load_dataset("papluca/language-identification")
-    ds_train = dataset['train']
-    ds_valid = dataset['validation']
+    dataset = load_dataset(dataset_name)
+    if 'validation' not in dataset.keys():
+        print("No validation set found. Creating validation set from train set...")
+        split_dataset = dataset['train'].train_test_split(test_size=0.1, seed=42)
+        ds_train = split_dataset['train']
+        ds_valid = split_dataset['test']
+    else:
+        ds_train = dataset['train']
+        ds_valid = dataset['validation']
+
     ds_test = dataset['test']
     print(f"Train / valid / test samples: {len(ds_train)} / {len(ds_valid)} / {len(ds_test)}")
 
     # Prepare label mappings
-    amazon_languages = ['en', 'de', 'fr', 'es', 'ja', 'zh']
-    xnli_languages = ['ar', 'el', 'hi', 'ru', 'th', 'tr', 'vi', 'bg', 'sw', 'ur']
-    stsb_languages = ['it', 'nl', 'pl', 'pt']
-    all_langs = sorted(list(set(amazon_languages + xnli_languages + stsb_languages)))
-    id2label = {idx: all_langs[idx] for idx in range(len(all_langs))}
+    all_langs = sorted(list(set(ds_train[label_column])))
+    id2label = {idx: lang for idx, lang in enumerate(all_langs)}
     label2id = {v: k for k, v in id2label.items()}
 
     # Tokenize and encode datasets
@@ -84,7 +91,7 @@ def main(model_ckpt):
     train_bs = 64
     eval_bs = train_bs * 2
     logging_steps = len(tok_train) // train_bs
-    output_dir = gdrive_dir / f"{model_ckpt.split('/')[-1]}-finetuned-language-detection"
+    output_dir = gdrive_dir / f"{model_ckpt.split('/')[-1]}-finetuned"
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -117,15 +124,21 @@ def main(model_ckpt):
     device = 0 if torch.cuda.is_available() else -1
     pipe = pipeline("text-classification", model=model, tokenizer=tokenizer, device=device)
     start_time = time.perf_counter()
-    model_preds = [s['label'] for s in pipe(ds_test.text.values.tolist(), truncation=True, max_length=128)]
+    model_preds = [s['label'] for s in pipe(ds_test[text_column].values.tolist(), truncation=True, max_length=128)]
     print(f"Our model time: {time.perf_counter() - start_time:.2f} seconds")
     print("Our Model Classification Report:")
-    print(classification_report(ds_test.labels.values.tolist(), model_preds, digits=3))
+    print(classification_report(ds_test[label_column].values.tolist(), model_preds, digits=3))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a language identification model")
     parser.add_argument("--model_checkpoint", type=str, default="xlm-roberta-base",
                         help="Model checkpoint to use for training")
+    parser.add_argument("--dataset", type=str, default="papluca/language-identification",
+                        help="Dataset to use for training")
+    parser.add_argument("--text_column", type=str, default="text",
+                        help="Name of the column containing the text data")
+    parser.add_argument("--label_column", type=str, default="labels",
+                        help="Name of the column containing the labels")
     args = parser.parse_args()
     
-    main(args.model_checkpoint)
+    train(args.model_checkpoint, args.dataset, args.text_column, args.label_column)

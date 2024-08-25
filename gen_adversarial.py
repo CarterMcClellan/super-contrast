@@ -156,7 +156,7 @@ def upload_combined_dataset(output_dir: str, dataset_name: str, original_dataset
     combined_dataset.push_to_hub(dataset_name)
     print(f"Uploaded combined dataset to {dataset_name}")
 
-def main(report_path: str, dataset_name: str, original_dataset_name: str, text_column: str, label_column: str):
+def gen_adversarial(report_path: str, dataset_name: str, original_dataset_name: str, text_column: str, label_column: str):
     # Part 1: Analyze model evaluation results
     report = read_report(report_path)
     analyze_trends(report)
@@ -229,4 +229,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    main(args.report_path, args.dataset_name, args.original_dataset_name, args.text_column, args.label_column)
+    gen_adversarial(args.report_path, args.dataset_name, args.original_dataset_name, args.text_column, args.label_column)
