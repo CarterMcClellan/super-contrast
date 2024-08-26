@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple, Union
 
 from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets, ClassLabel
 from tqdm.asyncio import tqdm
+from huggingface_hub import login
 
 # Custom types
 from sc_types import (
@@ -17,7 +18,6 @@ from sc_text import (
     AdversarialItem,
     AdversarialResponse,
 )
-
 
 def read_report(report_path: str) -> ModelEvaluation:
     with open(report_path, "r") as f:
@@ -170,19 +170,18 @@ def load_adversarial_examples(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# TODO This needs to be reworked
 def combine_datasets(original_dataset, adversarial_examples, text_column, label_column):
     if "validation" not in original_dataset.keys():
         print("No validation set found. Creating validation set from train set...")
         split_dataset = original_dataset["train"].train_test_split(test_size=0.1, seed=42)
         ds_train = split_dataset["train"]
         ds_valid = split_dataset["test"]
-    else: 
+    else:
         ds_train = original_dataset["train"]
         ds_valid = original_dataset["validation"]
 
     # Get the feature schema of the original dataset
-    features = ds_train.features
+    features = original_dataset['train'].features
 
     # Ensure the adversarial examples have the same structure as the original dataset
     adversarial_data = {
@@ -193,23 +192,13 @@ def combine_datasets(original_dataset, adversarial_examples, text_column, label_
     # Create a new dataset from the adversarial examples
     adversarial_dataset = Dataset.from_dict(adversarial_data)
 
-    # Convert the label column to match the original dataset's type
-    if isinstance(features[label_column], ClassLabel):
-        # If the original label is a ClassLabel, convert string labels to integers
-        label_names = features[label_column].names
-        adversarial_dataset = adversarial_dataset.map(
-            lambda x: {label_column: label_names.index(x[label_column])},
-            remove_columns=[label_column]
-        )
-    
     # Ensure the adversarial dataset has the same features as the original
     adversarial_dataset = adversarial_dataset.cast(features)
 
     # Combine the original dataset with the adversarial examples
     combined_train = concatenate_datasets(
-        [ds_train, adversarial_dataset]
+        [original_dataset["train"], adversarial_dataset]
     )
-
 
     # Create a new DatasetDict with the combined training set
     return DatasetDict(
@@ -228,6 +217,8 @@ def upload_combined_dataset(
     text_column: str,
     label_column: str,
 ):
+    login()
+
     # Load the original dataset
     original_dataset = load_dataset(original_dataset_name)
 
@@ -267,7 +258,7 @@ async def gen_adversarial(
 
     # Part 3: Generate new adversarial examples
     all_examples = await generate_new_examples(tasks, text_column, label_column)
-    
+
     output_dir = f"{dataset_name}_adversarial_examples"
     # Assuming save_flattened_examples is synchronous
     save_flattened_examples(all_examples, output_dir)
