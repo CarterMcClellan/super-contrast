@@ -1,10 +1,9 @@
-import argparse
-import json
-import os
+import argparse, json, os, asyncio
 from collections import defaultdict
 from typing import List, Dict, Tuple, Union
 
-from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
+from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets, ClassLabel
+from tqdm.asyncio import tqdm
 
 # Custom types
 from sc_types import (
@@ -12,21 +11,30 @@ from sc_types import (
     GroupedComparison,
     ModelEvaluation,
 )
-from sc_text import TaskGenerator, AdversarialGenerator, AdversarialItem, AdversarialResponse
+from sc_text import (
+    TaskGenerator,
+    AdversarialGenerator,
+    AdversarialItem,
+    AdversarialResponse,
+)
+
 
 def read_report(report_path: str) -> ModelEvaluation:
     with open(report_path, "r") as f:
         report = json.load(f)
     return ModelEvaluation(**report)
 
+
 def analyze_misclassifications(
     grouped_comparisons: Dict[str, GroupedComparison]
 ) -> Dict[str, Dict[str, int]]:
     misclassifications = defaultdict(lambda: defaultdict(int))
     for true_label, group in grouped_comparisons.items():
-        for pred_label, items in group.model_preds.items():
+        for _, items in group.model_preds.items():
+            pred_label = items[0].model_pred
             misclassifications[true_label][pred_label] = len(items)
-    return misclassifications # type: ignore
+    return misclassifications  # type: ignore
+
 
 def extract_top_trends(
     misclassifications: Dict[str, Dict[str, int]], top_n: int = 5
@@ -38,7 +46,8 @@ def extract_top_trends(
             trends.append((true_label, pred_label, count))
     return sorted(trends, key=lambda x: x[2], reverse=True)
 
-def create_adversarial_tasks(
+
+async def create_adversarial_tasks(
     data: Dict[str, GroupedComparison], output_dir: str, modality: str
 ) -> List[Dict]:
     os.makedirs(output_dir, exist_ok=True)
@@ -52,146 +61,244 @@ def create_adversarial_tasks(
     else:
         raise ValueError(f"Unsupported modality: {modality}")
 
+    async def process_examples(true_label, pred_label, examples):
+        example_data = [item.data for item in examples]
+
+        if len(example_data) <= 5:
+            print(f"Skipping task generation for {true_label} -> {pred_label}")
+            print("Not enough examples to generate a task")
+            return None
+
+        task = await task_generator.agenerate(
+            pred_label=pred_label,
+            true_label=true_label,
+            examples=example_data,
+        )
+
+        adv_prompt = AdversarialExample(
+            examples=example_data,
+            predicted_label=pred_label,
+            true_label=true_label,
+            task=task.task,
+        )
+
+        tasks.append(adv_prompt.dict())
+
+        # Standard file I/O operation
+        with open(
+            os.path.join(output_dir, f"adv_prompt_{true_label}_{pred_label}.json"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(adv_prompt.dict(), f, ensure_ascii=False, indent=4)
+
+        return adv_prompt.dict()
+
+    coroutines = []
     for true_label, group in data.items():
         for pred_label, examples in group.model_preds.items():
             if modality == "text":
-                example_data = [item.data for item in examples]
-
-                if len(example_data) <= 5:
-                    print(f"Skipping task generation for {true_label} -> {pred_label}")
-                    print("Not enough examples to generate a task")
-                    continue
-
-                task = task_generator.generate(
-                    pred_label=pred_label,
-                    true_label=true_label,
-                    examples=example_data, # type: ignore
-                )
-
-                adv_prompt = AdversarialExample(
-                    examples=example_data, # type: ignore
-                    predicted_label=pred_label,
-                    true_label=true_label,
-                    task=task.task,
-                )
-
-                tasks.append(adv_prompt.dict())
-
-                with open(
-                    os.path.join(
-                        output_dir, f"adv_prompt_{true_label}_{pred_label}.json"
-                    ),
-                    "w",
-                    encoding="utf-8",
-                ) as f:
-                    json.dump(adv_prompt.dict(), f, ensure_ascii=False, indent=4)
-
+                coroutines.append(process_examples(true_label, pred_label, examples))
             elif modality == "image":
                 raise NotImplementedError("Image modality is not yet supported")
             else:
                 raise ValueError(f"Unsupported modality: {modality}")
-    
+
+    results = await asyncio.gather(*coroutines)
+    tasks = [result for result in results if result is not None]
+
     return tasks
+
 
 def analyze_trends(data: ModelEvaluation):
     print(f"Analyzing trends in misclassifications for {data.model_name}...")
 
-    trends = extract_top_trends(
-        analyze_misclassifications(data.wrong_predictions)
-    )
+    trends = extract_top_trends(analyze_misclassifications(data.wrong_predictions))
     for true_label, pred_label, count in trends[:5]:
         print(f"  True label {true_label} misclassified as {pred_label}: {count} times")
-    
-    print(f"\nAccuracy for {data.model_name}: {data.accuracy:.2%}")
-    print(f"Total wrong predictions: {sum(len(items) for group in data.wrong_predictions.values() for items in group.model_preds.values())}")
 
-def generate_new_examples(task: Dict, generator: AdversarialGenerator) -> List[AdversarialItem]:
-    response: AdversarialResponse = generator.generate(
-        task=task['task'],
-        examples=task['examples']
+    print(f"\nAccuracy for {data.model_name}: {data.accuracy:.2%}")
+    print(
+        f"Total wrong predictions: {sum(len(items) for group in data.wrong_predictions.values() for items in group.model_preds.values())}"
     )
-    return response.data
+
+async def generate_new_examples(
+    tasks: List[Dict], text_column: str, label_column: str
+) -> List[Dict]:
+    generator = AdversarialGenerator()
+
+    async def process_task(task: Dict) -> List[Dict]:
+        try:
+            response: AdversarialResponse = await generator.agenerate(
+                task=task["task"], examples=task["examples"]
+            )
+            return [
+                {
+                    text_column: example.text,
+                    label_column: task["true_label"],
+                }
+                for example in response.data
+            ]
+        except Exception as e:
+            print(
+                f"Failed to generate new examples for {task['true_label']} "
+                f"(predicted as {task['predicted_label']}): {str(e)}"
+            )
+            return []
+
+    # Run all tasks concurrently with tqdm progress bar
+    results = await tqdm.gather(
+        *[process_task(task) for task in tasks],
+        desc="Generating new examples",
+        ascii=True  # Use ASCII characters for better compatibility
+    )
+
+    # Flatten the results
+    all_examples = [example for result in results for example in result]
+
+    return all_examples
+
 
 def save_flattened_examples(all_examples: List[Dict], output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     filename = "flattened_adversarial_examples.json"
-    with open(os.path.join(output_dir, filename), 'w', encoding='utf-8') as f:
+    with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as f:
         json.dump(all_examples, f, ensure_ascii=False, indent=4)
 
+
 def load_adversarial_examples(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+# TODO This needs to be reworked
 def combine_datasets(original_dataset, adversarial_examples, text_column, label_column):
+    if "validation" not in original_dataset.keys():
+        print("No validation set found. Creating validation set from train set...")
+        split_dataset = original_dataset["train"].train_test_split(test_size=0.1, seed=42)
+        ds_train = split_dataset["train"]
+        ds_valid = split_dataset["test"]
+    else: 
+        ds_train = original_dataset["train"]
+        ds_valid = original_dataset["validation"]
+
+    # Get the feature schema of the original dataset
+    features = ds_train.features
+
     # Ensure the adversarial examples have the same structure as the original dataset
     adversarial_data = {
         text_column: [example[text_column] for example in adversarial_examples],
-        label_column: [example[label_column] for example in adversarial_examples]
+        label_column: [example[label_column] for example in adversarial_examples],
     }
-    
+
     # Create a new dataset from the adversarial examples
     adversarial_dataset = Dataset.from_dict(adversarial_data)
-    
-    # Combine the original dataset with the adversarial examples
-    combined_train = concatenate_datasets([original_dataset['train'], adversarial_dataset])
-    
-    # Create a new DatasetDict with the combined training set
-    return DatasetDict({
-        'train': combined_train,
-        'validation': original_dataset['validation'],
-        'test': original_dataset['test']
-    })
 
-def upload_combined_dataset(output_dir: str, dataset_name: str, original_dataset_name: str, text_column: str, label_column: str):
+    # Convert the label column to match the original dataset's type
+    if isinstance(features[label_column], ClassLabel):
+        # If the original label is a ClassLabel, convert string labels to integers
+        label_names = features[label_column].names
+        adversarial_dataset = adversarial_dataset.map(
+            lambda x: {label_column: label_names.index(x[label_column])},
+            remove_columns=[label_column]
+        )
+    
+    # Ensure the adversarial dataset has the same features as the original
+    adversarial_dataset = adversarial_dataset.cast(features)
+
+    # Combine the original dataset with the adversarial examples
+    combined_train = concatenate_datasets(
+        [ds_train, adversarial_dataset]
+    )
+
+
+    # Create a new DatasetDict with the combined training set
+    return DatasetDict(
+        {
+            "train": combined_train,
+            "validation": ds_valid,
+            "test": original_dataset["test"],
+        }
+    )
+
+
+def upload_combined_dataset(
+    output_dir: str,
+    dataset_name: str,
+    original_dataset_name: str,
+    text_column: str,
+    label_column: str,
+):
     # Load the original dataset
     original_dataset = load_dataset(original_dataset_name)
-    
+
     # Load your new adversarial examples
-    adversarial_examples = load_adversarial_examples(os.path.join(output_dir, "flattened_adversarial_examples.json"))
-    
+    adversarial_examples = load_adversarial_examples(
+        os.path.join(output_dir, "flattened_adversarial_examples.json")
+    )
+
     # Combine datasets
-    combined_dataset = combine_datasets(original_dataset, adversarial_examples, text_column, label_column)
-    
+    combined_dataset = combine_datasets(
+        original_dataset, adversarial_examples, text_column, label_column
+    )
+
     # Push to Hugging Face Hub
     combined_dataset.push_to_hub(dataset_name)
     print(f"Uploaded combined dataset to {dataset_name}")
 
-def gen_adversarial(report_path: str, dataset_name: str, original_dataset_name: str, text_column: str, label_column: str):
-    # Part 1: Analyze model evaluation results
+
+async def gen_adversarial(
+    report_path: str,
+    dataset_name: str,
+    original_dataset_name: str,
+    text_column: str,
+    label_column: str,
+):
+    # Part 1: Analyze model evaluation results (assumed to be synchronous)
     report = read_report(report_path)
     analyze_trends(report)
 
     # Part 2: Create adversarial tasks
     tasks_dir = f"adversarial_tasks/{report.model_name}_wrong"
-    tasks = create_adversarial_tasks(
+    tasks = await create_adversarial_tasks(
         report.wrong_predictions,
         tasks_dir,
-        "text",  # Assuming text modality for model evaluation
+        "text",
     )
 
     # Part 3: Generate new adversarial examples
-    output_dir = "new_training_examples"
-    generator = AdversarialGenerator()
-    all_examples = []
-
-    for task in tasks:
-        try:
-            new_examples = generate_new_examples(task, generator)
-        except:
-            print(f"Failed to generate new examples for {task['true_label']} (predicted as {task['predicted_label']})")
-            continue
-        for example in new_examples:
-            flattened_example = {
-                text_column: example.text,
-                label_column: task['true_label']
-            }
-            all_examples.append(flattened_example)
-        
-        print(f"Generated {len(new_examples)} new examples for {task['true_label']} (predicted as {task['predicted_label']})")
+    all_examples = await generate_new_examples(tasks, text_column, label_column)
     
+    output_dir = f"{dataset_name}_adversarial_examples"
+    # Assuming save_flattened_examples is synchronous
     save_flattened_examples(all_examples, output_dir)
-    print(f"Saved {len(all_examples)} flattened examples to {output_dir}/flattened_adversarial_examples.json")
-    upload_combined_dataset(output_dir, dataset_name, original_dataset_name, text_column, label_column)
+    print(
+        f"Saved {len(all_examples)} flattened examples to {output_dir}/flattened_adversarial_examples.json"
+    )
+
+    # Assuming upload_combined_dataset is asynchronous
+    upload_combined_dataset(
+        output_dir, dataset_name, original_dataset_name, text_column, label_column
+    )
+
+def run_gen_adversarial(
+    report_path: str,
+    dataset_name: str,
+    original_dataset_name: str,
+    text_column: str,
+    label_column: str,
+):
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # We're in an environment with an existing event loop (e.g., Jupyter)
+        asyncio.create_task(gen_adversarial(
+            report_path, dataset_name, original_dataset_name, text_column, label_column
+        ))
+    else:
+        # We're in a regular Python environment
+        loop.run_until_complete(gen_adversarial(
+            report_path, dataset_name, original_dataset_name, text_column, label_column
+        ))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -229,4 +336,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    gen_adversarial(args.report_path, args.dataset_name, args.original_dataset_name, args.text_column, args.label_column)
+    run_gen_adversarial(
+        args.report_path,
+        args.dataset_name,
+        args.original_dataset_name,
+        args.text_column,
+        args.label_column,
+    )

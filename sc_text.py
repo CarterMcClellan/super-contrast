@@ -76,6 +76,15 @@ class TaskGenerator:
 
         return result
 
+    async def agenerate(
+        self, pred_label: str, true_label: str, examples: List[str]
+    ) -> TaskGeneratorResponse:
+        result: TaskGeneratorResponse = await self.generator.ainvoke(
+            {"pred_label": pred_label, "true_label": true_label, "examples": examples}
+        )
+        return result
+
+
 ADVERSARIAL_PROMPT = """You are a helpful assistant which generates adversarial examples based on a trend in the text data.
 
 For example
@@ -148,12 +157,15 @@ Data:
 }
 ```"""
 
+
 class AdversarialItem(BaseModel):
     text: str
-    label: str 
+    label: str
+
 
 class AdversarialResponse(BaseModel):
     data: List[AdversarialItem]
+
 
 class AdversarialGenerator:
     def __init__(self):
@@ -173,9 +185,19 @@ class AdversarialGenerator:
 
         self.generator = prompt | llm | parser
 
-    def generate(self, task: str, examples: List[AdversarialItem]) -> AdversarialResponse:
+    def generate(
+        self, task: str, examples: List[AdversarialItem]
+    ) -> AdversarialResponse:
         result: AdversarialResponse = self.generator.invoke(
             {"task": task, "examples": examples}
         )
 
+        return result
+    
+    async def agenerate(
+        self, task: str, examples: List[AdversarialItem]
+    ) -> AdversarialResponse:
+        result: AdversarialResponse = await self.generator.ainvoke(
+            {"task": task, "examples": examples}
+        )
         return result
