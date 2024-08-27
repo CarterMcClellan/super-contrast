@@ -1,0 +1,9 @@
+datasets
+langchain
+langchain-anthropic
+langchain-openai
+scikit-learn
+torch
+torchvision
+transformers
+transformers[torch]
