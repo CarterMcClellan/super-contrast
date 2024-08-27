@@ -19,6 +19,13 @@ from sc_text import (
     AdversarialResponse,
 )
 
+# LLM
+from llm_adversarial import (
+    ClassificationItem,
+    AdversarialLlmOpenAI as AdversarialLlm,
+)
+
+
 def read_report(report_path: str) -> ModelEvaluation:
     with open(report_path, "r") as f:
         report = json.load(f)
@@ -45,6 +52,64 @@ def extract_top_trends(
         for pred_label, count in sorted_preds[:top_n]:
             trends.append((true_label, pred_label, count))
     return sorted(trends, key=lambda x: x[2], reverse=True)
+
+
+def analyze_trends(data: ModelEvaluation):
+    print(f"Analyzing trends in misclassifications for {data.model_name}...")
+
+    trends = extract_top_trends(analyze_misclassifications(data.wrong_predictions))
+    for true_label, pred_label, count in trends[:5]:
+        print(f"  True label {true_label} misclassified as {pred_label}: {count} times")
+
+    print(f"\nAccuracy for {data.model_name}: {data.accuracy:.2%}")
+    print(
+        f"Total wrong predictions: {sum(len(items) for group in data.wrong_predictions.values() for items in group.model_preds.values())}"
+    )
+    
+
+async def generate_llm_data(
+    data: ModelEvaluation,
+    text_column: str,
+    label_column: str,
+):
+    # Hardcoded for now
+    task = "Identify whether the review for the movie is positive or negative."
+    labels = {
+        "1": "positive",
+        "0": "negative",
+    }
+    
+    # Initialize the LLM model
+    adversarial_llm = AdversarialLlm()
+
+    examples_list = []
+    for _, group in data.wrong_predictions.items():
+        for cluster, items in group.model_preds.items():
+            examples = [
+                ClassificationItem(text=item.data, true_label=item.true_label, incorrect_label=item.model_pred) for item in items if item.data
+            ]
+            examples_list.append(examples)
+            
+    async def process_examples(examples) -> List[Dict]:
+        response = await adversarial_llm.agenerate(task, labels, examples)
+        return [
+            {
+                text_column: example.text,
+                label_column: example.true_label,
+            }
+            for example in response.data
+        ]
+
+    results = await tqdm.gather(
+        *[process_examples(examples) for examples in examples_list],
+        desc="Generating new examples",
+        ascii=True  # Use ASCII characters for better compatibility
+    )
+    
+    # Flatten the results
+    all_examples = [example for result in results for example in result]
+
+    return all_examples
 
 
 async def create_adversarial_tasks(
@@ -110,18 +175,6 @@ async def create_adversarial_tasks(
     return tasks
 
 
-def analyze_trends(data: ModelEvaluation):
-    print(f"Analyzing trends in misclassifications for {data.model_name}...")
-
-    trends = extract_top_trends(analyze_misclassifications(data.wrong_predictions))
-    for true_label, pred_label, count in trends[:5]:
-        print(f"  True label {true_label} misclassified as {pred_label}: {count} times")
-
-    print(f"\nAccuracy for {data.model_name}: {data.accuracy:.2%}")
-    print(
-        f"Total wrong predictions: {sum(len(items) for group in data.wrong_predictions.values() for items in group.model_preds.values())}"
-    )
-
 async def generate_new_examples(
     tasks: List[Dict], text_column: str, label_column: str
 ) -> List[Dict]:
@@ -169,6 +222,7 @@ def save_flattened_examples(all_examples: List[Dict], output_dir: str):
 def load_adversarial_examples(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def combine_datasets(original_dataset, adversarial_examples, text_column, label_column):
     if "validation" not in original_dataset.keys():
@@ -247,17 +301,20 @@ async def gen_adversarial(
     # Part 1: Analyze model evaluation results (assumed to be synchronous)
     report = read_report(report_path)
     analyze_trends(report)
+    
+    # Part 2: Generate new adversarial examples
+    all_examples = await generate_llm_data(report, text_column, label_column)
 
-    # Part 2: Create adversarial tasks
-    tasks_dir = f"adversarial_tasks/{report.model_name}_wrong"
-    tasks = await create_adversarial_tasks(
-        report.wrong_predictions,
-        tasks_dir,
-        "text",
-    )
+    # # Part 2: Create adversarial tasks
+    # tasks_dir = f"adversarial_tasks/{report.model_name}_wrong"
+    # tasks = await create_adversarial_tasks(
+    #     report.wrong_predictions,
+    #     tasks_dir,
+    #     "text",
+    # )
 
-    # Part 3: Generate new adversarial examples
-    all_examples = await generate_new_examples(tasks, text_column, label_column)
+    # # Part 3: Generate new adversarial examples
+    # all_examples = await generate_new_examples(tasks, text_column, label_column)
 
     output_dir = f"{dataset_name}_adversarial_examples"
     # Assuming save_flattened_examples is synchronous
