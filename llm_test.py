@@ -1,4 +1,4 @@
-from llm_adversarial import AdversarialLlmOpenAnthropic as Llm, ClassificationItem
+from llm_adversarial import AdversarialLlmAnthropic as Llm, ClassificationItem
 
 task = "Identify whether the review for the movie is positive or negative."
 labels = {
@@ -66,4 +66,4 @@ examples = [
 adversarial_llm = Llm()
 response = adversarial_llm.generate(task, labels, examples)
 
-print(response.model_dump_json(indent=4))
+print(response.model_dump_json(indent=4)) 

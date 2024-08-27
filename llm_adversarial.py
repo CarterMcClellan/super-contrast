@@ -167,6 +167,10 @@ Data:
 }
 ```"""
 
+
+# Types
+
+
 class ClassificationItem(BaseModel):
     text: str
     true_label: str
@@ -206,12 +210,21 @@ class AdversarialLlmOpenAI:
                 "examples": examples
             }
         )
-        
+        return result
+    
+    async def agenerate(self, task: str, labels: Dict[str, str], examples: List[ClassificationItem]) -> AdversarialResponse:
+        result: AdversarialResponse = await self.generator.ainvoke(
+            {
+                "task": task,
+                "labels": labels,
+                "examples": examples
+            }
+        )
         return result
 
 # Anthropic
 
-class AdversarialLlmOpenAnthropic:
+class AdversarialLlmAnthropic:
     def __init__(self):
         model = ChatAnthropic(
             **{
@@ -237,5 +250,14 @@ class AdversarialLlmOpenAnthropic:
                 "examples": examples
             }
         )
-        
+        return result
+    
+    async def agenerate(self, task: str, labels: Dict[str, str], examples: List[ClassificationItem]) -> AdversarialResponse:
+        result: AdversarialResponse = await self.generator.ainvoke(
+            {
+                "task": task,
+                "labels": labels,
+                "examples": examples
+            }
+        )
         return result
